@@ -24,7 +24,11 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.utils.checkpoint
 from torch import nn
+import torch.nn.functional as F
 from torch.nn import BCEWithLogitsLoss, CrossEntropyLoss, MSELoss
+import numpy as np
+import pdb
+import wandb
 
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutputWithPast, CausalLMOutputWithPast, SequenceClassifierOutputWithPast
@@ -32,6 +36,10 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import add_start_docstrings, add_start_docstrings_to_model_forward, logging, replace_return_docstrings
 from llama_landmark_config import LlamaLandmarkConfig
 from ltriton.flash_landmark_attention import fused_landmark_attention
+
+# from transformers.models.llama.modeling_llama import LlamaAttention, LlamaModel, LlamaDecoderLayer, LlamaForCausalLM
+# from transformers.models.llama.modeling_llama import apply_rotary_pos_emb, repeat_kv
+# from transformers.cache_utils import Cache
 
 
 logger = logging.get_logger(__name__)
@@ -165,89 +173,15 @@ class LlamaMLP(nn.Module):
     def forward(self, x):
         return self.down_proj(self.act_fn(self.gate_proj(x)) * self.up_proj(x))
 
-class LandmarkGroupedSoftmaxFunction(torch.autograd.Function):
-
-    # Note that forward, setup_context, and backward are @staticmethods
-    @staticmethod
-    def forward(ctx, x, dim, mem_cnt, resp_mem_idx):
-        new_shape = list(x.shape)
-        new_shape[dim] = mem_cnt # max_mem_cnt.item()
-        max_by_group = x.new_zeros((*new_shape,))
-        max_by_group.scatter_reduce_(src=x, index=resp_mem_idx, dim=dim, reduce="amax", include_self=False)
-            
-        maxes = torch.gather(max_by_group, dim, resp_mem_idx)
-        #x_exp = torch.exp(x - torch.where(torch.isinf(maxes), 0, maxes))
-        x_exp = torch.exp((x - maxes).to(torch.float32))
-
-        cumsum_by_group = torch.zeros_like(max_by_group, dtype=x_exp.dtype)
-
-        cumsum_by_group.scatter_add_(dim, resp_mem_idx, x_exp, )
-        denom = torch.gather(cumsum_by_group, dim, resp_mem_idx)
-
-        #probs = torch.where(denom < 0.5, 0, x_exp / denom)
-        probs = x_exp / denom
-        
-        
-        ctx.mem_cnt = mem_cnt
-        ctx.dim = dim
-        ctx.save_for_backward(resp_mem_idx, probs)
-
-        return probs
-
-    @staticmethod
-    def backward(ctx, grad_probs):
-        mem_cnt = ctx.mem_cnt
-        dim = ctx.dim
-        resp_mem_idx, probs = ctx.saved_tensors
-        grad_x = grad_dim = grad_mem_cnt = grad_resp_mem_idx = None
-
-        if ctx.needs_input_grad[0] or ctx.needs_input_grad[4]:
-            grad_pair = grad_probs * probs
-
-            new_shape = list(probs.shape)
-            new_shape[dim] = mem_cnt # max_mem_cnt.item()
-            cumsum_by_group = grad_pair.new_zeros((*new_shape,))
-            cumsum_by_group.scatter_add_(dim, resp_mem_idx, grad_pair)
-
-
-        if ctx.needs_input_grad[0]:
-            grad_sum = torch.gather(cumsum_by_group, dim, resp_mem_idx)
-            grad_x = grad_pair - probs * grad_sum
-        assert not ctx.needs_input_grad[1]
-        assert not ctx.needs_input_grad[2]
-        assert not ctx.needs_input_grad[3]
-        
-        return grad_x, grad_dim, grad_mem_cnt, grad_resp_mem_idx
-
-def landmark_grouped_softmax(x, dim, is_mem, last_section_mask):
-    
-    last_and_rest_mask = last_section_mask # | mask
-
-    full_access_mask =  is_mem | last_and_rest_mask
-
-    max_mem_cnt = 64
-    mem_group_idx = torch.cumsum(is_mem, dim=dim)
-    mem_bucket_id = max_mem_cnt - 1
-    resp_mem_idx = torch.where(last_and_rest_mask, 
-                                max_mem_cnt - 1,
-                                torch.where(is_mem, mem_bucket_id, mem_group_idx))
-    probs = LandmarkGroupedSoftmaxFunction.apply(x, dim, max_mem_cnt, resp_mem_idx)
-
-    new_shape = list(x.shape)
-    new_shape[dim] = max_mem_cnt
-    group_prob = probs.new_zeros((*new_shape, ))
-    group_prob.scatter_(dim, torch.where(is_mem, mem_group_idx - 1, max_mem_cnt - 1), probs)
-    probs = probs.mul(torch.where(full_access_mask, last_section_mask, torch.gather(group_prob, dim, resp_mem_idx)))
-
-
-    return probs
 
 class LlamaAttention(nn.Module):
     """Multi-headed attention from 'Attention Is All You Need' paper"""
 
-    def __init__(self, config: LlamaLandmarkConfig):
+    def __init__(self, config: LlamaLandmarkConfig, layer_idx: Optional[int] = None):
         super().__init__()
         self.config = config
+        self.layer_idx = layer_idx
+        self.top_k = 1
         self.hidden_size = config.hidden_size
         self.num_heads = config.num_attention_heads
         self.head_dim = self.hidden_size // self.num_heads
@@ -266,6 +200,35 @@ class LlamaAttention(nn.Module):
 
     def _shape(self, tensor: torch.Tensor, seq_len: int, bsz: int):
         return tensor.view(bsz, seq_len, self.num_heads, self.head_dim).transpose(1, 2).contiguous()
+    
+    def mem_attention(self, is_mem: torch.Tensor, b: Union[torch.Tensor, int]):
+        batch_size, _, _, num_tokens = is_mem.shape
+        attention_masks = torch.zeros((batch_size, 1, num_tokens//(b+1), num_tokens), dtype=bool).to(is_mem.device)
+        for i in range(0, num_tokens//(b+1)):
+            attention_masks[..., i, i*(b+1):(i+1)*(b+1)-1] = True
+        return attention_masks
+
+    def take_topk_mem(self, attn_weights: torch.Tensor, attn_mem_key: torch.Tensor, b: Union[torch.Tensor, int]):
+        # pdb.set_trace()
+        top_k = torch.topk(attn_mem_key, k=self.top_k, dim=-1)[1]
+        ind = torch.zeros(attn_weights.shape[2], b*self.top_k, dtype=torch.int32).to(attn_weights.device)
+        arange = torch.arange(attn_weights.shape[2]).view(-1, 1).to(attn_weights.device)
+        arange = arange.repeat(1, b*self.top_k).view(-1)
+        mask = torch.zeros(attn_weights.shape[-2], attn_weights.shape[-1], dtype=bool).to(attn_weights.device)
+        for t in range(b*(self.top_k+1), attn_weights.shape[-2]):
+            temp = (t+1)//b if (t+1)%b!=0 else t//b
+            mask[t, temp*(b+1):] = True
+        for batch in range(attn_weights.shape[0]):
+            for head in range(attn_weights.shape[1]):
+                ind[:, :self.top_k] = top_k[batch, head]*(b+1)
+                for k in range(1, b):
+                    ind[:, k*self.top_k:(k+1)*self.top_k] = ind[:, (k-1)*self.top_k:k*self.top_k]+1
+                current_mask = mask.clone()
+                current_mask[arange, ind.view(-1)] = True
+                attn_weights[batch, head, b*(self.top_k+1):] *= current_mask[b*(self.top_k+1):]
+        # pdb.set_trace()
+        attn_weights = attn_weights/torch.sum(attn_weights, dim=-1, keepdim=True)
+        return attn_weights
 
     def forward(
         self,
@@ -280,23 +243,54 @@ class LlamaAttention(nn.Module):
         offload_cache_to_cpu: bool = False,
         use_flash: bool = False,
         cache_top_k: Optional[int] = None,
-        mem_freq: Optional[int] = None
+        mem_freq: Optional[int] = None,
+        top_mem: Optional[int] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[Tuple[torch.Tensor]]]:
         bsz, q_len, _ = hidden_states.size()
 
         query_states = self.q_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         key_states = self.k_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
         value_states = self.v_proj(hidden_states).view(bsz, q_len, self.num_heads, self.head_dim).transpose(1, 2)
+        # key_states shape = BxNxTxhd
+        # is_mem shape = Bx1xTxT
 
         kv_seq_len = key_states.shape[-2]
         if past_key_value is not None:
             kv_seq_len += past_key_value[0].shape[-2]
             if len(past_key_value) > 2:
                 kv_seq_len += past_key_value[3].shape[2] * past_key_value[3].shape[3]
-        cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
+        
+        attention_mask = torch.where(is_mem, torch.min(attention_mask), attention_mask)
+        is_mem_orig = is_mem
+        is_mem = is_mem[:, ..., -1, :].reshape((-1, 1, 1, kv_seq_len))
+        mem_positions = torch.where(is_mem[0][0][0])[0]
+        # Infer the block size `b` by calculating the gaps between memory tokens
+        # gaps = torch.diff(mem_positions)
+        assert len(mem_positions) > 0
+        b = mem_positions[0]  # Assuming all blocks are of equal size
+        orig_token_mask = torch.zeros((kv_seq_len)).bool()
+        for i in range(0, kv_seq_len, b+1):
+            orig_token_mask[i: min(i+b, kv_seq_len)] = True
+        mem_attn_mask = self.mem_attention(is_mem, b)
+        attention_mask[..., ~orig_token_mask, :] = torch.where(
+            mem_attn_mask, attention_mask[..., ~orig_token_mask, :], torch.min(attention_mask))
+        # pdb.set_trace()
+
+
+        orig_query_states = query_states[..., orig_token_mask, :]
+        orig_key_states = key_states[..., orig_token_mask, :]
+        orig_kv_seq_len = orig_key_states.shape[-2]
+        orig_position_ids = position_ids -  torch.cumsum(is_mem[:, 0, -1, :], -1)
+        # orig_position_ids = torch.arange(orig_kv_seq_len)
+        orig_position_ids = orig_position_ids[..., orig_token_mask]
+        # cos, sin = self.rotary_emb(value_states, seq_len=kv_seq_len)
         key_states_before_pos = key_states
-        query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        cos, sin = self.rotary_emb(key_states, seq_len=orig_kv_seq_len)
+        # query_states, key_states = apply_rotary_pos_emb(query_states, key_states, cos, sin, position_ids)
+        orig_query_states, orig_key_states = apply_rotary_pos_emb(orig_query_states, orig_key_states, cos, sin, orig_position_ids)
         # [bsz, nh, t, hd]
+        query_states[..., orig_token_mask, :] = orig_query_states
+        key_states[..., orig_token_mask, :] = orig_key_states
 
         attn_prefix = None
         if past_key_value is not None:
@@ -439,6 +433,7 @@ class LlamaAttention(nn.Module):
             past_key_value = (past_key_states, past_value_states) if use_cache else None
 
         if use_flash:
+            assert 0
             assert attn_prefix is None
             assert not output_attentions
             assert mem_freq is not None
@@ -466,10 +461,28 @@ class LlamaAttention(nn.Module):
                 raise ValueError("Don't use this without landmarks")
                 attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
             else:
-                attn_weights = landmark_grouped_softmax(attn_weights, dim=-1, is_mem=is_mem.expand(-1, self.num_heads, -1, -1), last_section_mask=last_section_mask).to(query_states.dtype)
+                attn_weights = nn.functional.softmax(attn_weights, dim=-1, dtype=torch.float32).to(query_states.dtype)
+                # attn_weights = landmark_grouped_softmax(attn_weights, dim=-1, is_mem=is_mem.expand(-1, self.num_heads, -1, -1), last_section_mask=last_section_mask).to(query_states.dtype)
             if attn_prefix is not None:
                 attn_prefix, attn_weights = torch.split(attn_weights, (attn_prefix.shape[-1], attn_weights.shape[-1] - attn_prefix.shape[-1]), dim=-1)
+
+            attn_mem_key = torch.matmul(query_states[..., orig_token_mask, :],
+                         key_states[..., ~orig_token_mask, :].transpose(2, 3)) / math.sqrt(self.head_dim)
+            attn_mem_key = attn_mem_key + torch.where(is_mem_orig[..., orig_token_mask, :][..., ~orig_token_mask], 0.0,
+                                                                    torch.min(attention_mask))
+            attn_mem_key = torch.max(attn_mem_key, torch.tensor(torch.finfo(attn_mem_key.dtype).min))
+
+            if top_mem and self.layer_idx>0:
+                attn_weights[..., orig_token_mask, :] = self.take_topk_mem(attn_weights[..., orig_token_mask, :], attn_mem_key, b).to(attn_weights.dtype)
             attn_output = torch.matmul(attn_weights, value_states)
+
+            attn_mem_key = nn.functional.log_softmax(attn_mem_key, dim=-1,
+                                                 dtype=torch.float32).to(query_states.dtype)
+            gt_block_probs = torch.zeros((attn_weights.shape[0], attn_weights.shape[1],
+                                          torch.sum(orig_token_mask), attn_weights.shape[3]//(b+1))).to(attn_mem_key.device)
+            # attn_weights[..., orig_token_mask]
+            for i in range(0, attn_weights.shape[-1]//(b+1)):
+                gt_block_probs[..., i] = torch.sum(attn_weights[..., orig_token_mask, i*(b+1) : (i+1)*(b+1)-1], dim=-1)
             if attn_prefix is not None:
                 attn_output += torch.matmul(attn_prefix.unsqueeze(3), selected_values).squeeze(3)
 
@@ -484,15 +497,19 @@ class LlamaAttention(nn.Module):
         attn_output = attn_output.transpose(1, 2)
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size)
         attn_output = self.o_proj(attn_output)
+        # pdb.set_trace()
+        assert attn_mem_key.shape == gt_block_probs.shape
+        ce_loss = torch.sum(-1*gt_block_probs*attn_mem_key, dim=-1)[:, :, b*(self.top_k+1):]
+        ce_loss = torch.mean(ce_loss)
 
-        return attn_output, attn_weights, past_key_value
+        return attn_output, attn_weights, past_key_value, ce_loss
 
 
 class LlamaDecoderLayer(nn.Module):
-    def __init__(self, config: LlamaLandmarkConfig):
+    def __init__(self, config: LlamaLandmarkConfig, layer_idx: int):
         super().__init__()
         self.hidden_size = config.hidden_size
-        self.self_attn = LlamaAttention(config=config)
+        self.self_attn = LlamaAttention(config=config, layer_idx=layer_idx)
         self.mlp = LlamaMLP(
             hidden_size=self.hidden_size,
             intermediate_size=config.intermediate_size,
@@ -514,7 +531,8 @@ class LlamaDecoderLayer(nn.Module):
         offload_cache_to_cpu: bool = False,
         use_flash: bool = False,
         cache_top_k: Optional[int] = None,
-        mem_freq: Optional[int] = None
+        mem_freq: Optional[int] = None,
+        top_mem: Optional[int] = None,
     ) -> Tuple[torch.FloatTensor, Optional[Tuple[torch.FloatTensor, torch.FloatTensor]]]:
         """
         Args:
@@ -535,7 +553,7 @@ class LlamaDecoderLayer(nn.Module):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, self_attn_weights, present_key_value = self.self_attn(
+        hidden_states, self_attn_weights, present_key_value, mem_ce_loss = self.self_attn(
             hidden_states=hidden_states,
             attention_mask=attention_mask,
             position_ids=position_ids,
@@ -547,7 +565,8 @@ class LlamaDecoderLayer(nn.Module):
             offload_cache_to_cpu=offload_cache_to_cpu,
             use_flash=use_flash,
             cache_top_k=cache_top_k,
-            mem_freq=mem_freq
+            mem_freq=mem_freq,
+            top_mem=top_mem
         )
         hidden_states = residual + hidden_states
 
@@ -564,6 +583,7 @@ class LlamaDecoderLayer(nn.Module):
 
         if use_cache:
             outputs += (present_key_value,)
+        outputs += (mem_ce_loss,)
 
         return outputs
 
@@ -694,7 +714,8 @@ class LlamaModel(LlamaPreTrainedModel):
         self.vocab_size = config.vocab_size
 
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
-        self.layers = nn.ModuleList([LlamaDecoderLayer(config) for _ in range(config.num_hidden_layers)])
+        self.layers = nn.ModuleList(
+            [LlamaDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)])
         self.norm = LlamaRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
         self.gradient_checkpointing = False
@@ -746,7 +767,8 @@ class LlamaModel(LlamaPreTrainedModel):
         offload_cache_to_cpu: Optional[bool] = None,
         use_flash: Optional[bool] = None,
         cache_top_k: Optional[int] = None,
-        mem_freq: Optional[int] = None
+        mem_freq: Optional[int] = None,
+        top_mem: Optional[int] = None,
     ) -> Union[Tuple, BaseModelOutputWithPast]:
         output_attentions = output_attentions if output_attentions is not None else self.config.output_attentions
         output_hidden_states = (
@@ -795,6 +817,7 @@ class LlamaModel(LlamaPreTrainedModel):
 
         if inputs_embeds is None:
             inputs_embeds = self.embed_tokens(input_ids)
+            inputs_embeds = torch.where(is_mem[..., None], self.mem_emb, inputs_embeds)
         # embed positions
         if attention_mask is None:
             attention_mask = torch.ones(
@@ -828,6 +851,7 @@ class LlamaModel(LlamaPreTrainedModel):
         all_hidden_states = () if output_hidden_states else None
         all_self_attns = () if output_attentions else None
         next_decoder_cache = () if use_cache else None
+        all_mem_ce_loss = ()
 
         for idx, decoder_layer in enumerate(self.layers):
             if output_hidden_states:
@@ -871,9 +895,12 @@ class LlamaModel(LlamaPreTrainedModel):
                     use_flash=use_flash,
                     cache_top_k=cache_top_k,
                     mem_freq=mem_freq,
+                    top_mem=top_mem,
                 )
 
             hidden_states = layer_outputs[0]
+            if idx > 0:
+                all_mem_ce_loss += (layer_outputs[-1],)
 
             if use_cache:
                 next_decoder_cache += (layer_outputs[2 if output_attentions else 1],)
@@ -895,7 +922,7 @@ class LlamaModel(LlamaPreTrainedModel):
             past_key_values=next_cache,
             hidden_states=all_hidden_states,
             attentions=all_self_attns,
-        )
+        ), all_mem_ce_loss
 
 
 class LlamaForCausalLM(LlamaPreTrainedModel):
@@ -1010,13 +1037,84 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if use_flash:
             assert window_len % (mem_freq + 1) == 0
         last_logits = None
+        '''
+        with torch.no_grad():
+            # pdb.set_trace()
+            for step, idx in enumerate(range(0, input_ids.shape[1], window_len)):
+                if idx >= 1:
+                    if output_attentions or output_hidden_states:
+                        raise NotImplementedError
+                    if not use_cache:
+                        raise NotImplementedError
+                outputs, _ = self.model(
+                    input_ids=input_ids[:, idx:idx + window_len],
+                    attention_mask=attention_mask[:, :idx + window_len + attention_mask.shape[1] - input_ids.shape[1]] if attention_mask is not None else None,
+                    position_ids=position_ids[:, idx:idx + window_len] if position_ids is not None else None,
+                    past_key_values=past_key_values,
+                    inputs_embeds=inputs_embeds[:, idx:idx + window_len] if inputs_embeds is not None else None,
+                    use_cache=use_cache,
+                    output_attentions=output_attentions,
+                    output_hidden_states=output_hidden_states,
+                    return_dict=return_dict,
+                    offload_cache_to_cpu=offload_cache_to_cpu,
+                    use_flash=(use_flash or self.auto_insert_landmarks),
+                    cache_top_k=cache_top_k,
+                    mem_freq=mem_freq,
+                    top_mem=1,
+                )
+                # past_key_values = outputs[1]
+                # if last_logits is not None:
+                #     last_logits = torch.cat((last_logits, outputs[0]), dim=-2)
+                last_logits = outputs[0]
+            hidden_states = last_logits
+            if self.auto_insert_landmarks:
+                block_size = self.config.mem_freq + 1
+                hidden_states = hidden_states.reshape(hidden_states.shape[0], hidden_states.shape[1] // block_size, block_size, hidden_states.shape[2])
+                hidden_states = hidden_states[:, :, :block_size - 1]
+                hidden_states = hidden_states.reshape(hidden_states.shape[0], -1, hidden_states.shape[3])
+            if drop_last_logit_if_mem:
+                is_any_mem = (input_ids[:, -1] == self.config.mem_id).any()
+                are_all_mem = (input_ids[:, -1] == self.config.mem_id).all()
+                assert is_any_mem == are_all_mem
+                if is_any_mem:
+                    hidden_states = hidden_states[:, :-1]
+            logits = self.lm_head(hidden_states)
+            loss = None
+            if labels is not None:
+                is_mem = input_ids == self.config.mem_id
+                # pdb.set_trace()
+                b = torch.where(is_mem[0])[0][0]
+                orig_token_mask = torch.zeros((input_ids.shape[-1])).bool()
+                for i in range(0, input_ids.shape[-1], b+1):
+                    orig_token_mask[i: min(i+b, input_ids.shape[-1])] = True
+                logits = logits[..., orig_token_mask, :]
+                orig_labels = labels[..., orig_token_mask]
+                # Shift so that tokens < n predict n
+                shift_logits = logits[..., :-1, :].contiguous()
+                shift_labels = orig_labels[..., 1:].contiguous()
+                # Flatten the tokens
+                loss_fct = CrossEntropyLoss(reduction='none')
+                shift_logits = shift_logits.view(-1, self.config.vocab_size)
+                shift_labels = shift_labels.view(-1)
+                # Enable model parallelism
+                shift_labels = shift_labels.to(shift_logits.device)
+                loss = loss_fct(shift_logits, shift_labels)
+                mask = (shift_labels != self.config.pad_id)
+                loss = torch.sum(loss*mask)/(torch.sum(mask))
+                logits_pred = torch.argmax(shift_logits, dim=-1)
+                accuracy = (logits_pred == shift_labels)*mask
+                accuracy = torch.sum(accuracy)/torch.sum(mask)
+            wandb.log({'top_k_accuracy': accuracy, 'top_k_pplx_loss': loss})
+            del logits
+        last_logits = None
+        '''
         for step, idx in enumerate(range(0, input_ids.shape[1], window_len)):
             if idx >= 1:
                 if output_attentions or output_hidden_states:
                     raise NotImplementedError
                 if not use_cache:
                     raise NotImplementedError
-            outputs = self.model(
+            outputs, all_mem_ce_loss = self.model(
                 input_ids=input_ids[:, idx:idx + window_len],
                 attention_mask=attention_mask[:, :idx + window_len + attention_mask.shape[1] - input_ids.shape[1]] if attention_mask is not None else None,
                 position_ids=position_ids[:, idx:idx + window_len] if position_ids is not None else None,
@@ -1052,16 +1150,34 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
 
         loss = None
         if labels is not None:
+            is_mem = input_ids == self.config.mem_id
+            b = torch.where(is_mem[0])[0]
+            orig_token_mask = torch.zeros((input_ids.shape[-1])).bool()
+            for i in range(0, input_ids.shape[-1], b+1):
+                orig_token_mask[i: min(i+b, input_ids.shape[-1])] = True
+            logits = logits[..., orig_token_mask, :]
+            orig_labels = labels[..., orig_token_mask]
             # Shift so that tokens < n predict n
             shift_logits = logits[..., :-1, :].contiguous()
-            shift_labels = labels[..., 1:].contiguous()
+            shift_labels = orig_labels[..., 1:].contiguous()
             # Flatten the tokens
-            loss_fct = CrossEntropyLoss()
+            loss_fct = CrossEntropyLoss(reduction='none')
             shift_logits = shift_logits.view(-1, self.config.vocab_size)
             shift_labels = shift_labels.view(-1)
             # Enable model parallelism
             shift_labels = shift_labels.to(shift_logits.device)
             loss = loss_fct(shift_logits, shift_labels)
+            mask = (shift_labels != self.config.pad_id)
+            loss = torch.sum(loss*mask)/(torch.sum(mask))
+            logits_pred = torch.argmax(shift_logits, dim=-1)
+            accuracy = (logits_pred == shift_labels)*mask
+            accuracy = torch.sum(accuracy)/torch.sum(mask)
+        wandb.log({'accuracy': accuracy, 'pplx_loss': loss})
+        loss = 0
+        for i in range(len(all_mem_ce_loss)):
+            wandb.log({f'mem_ce_loss_layer_{i+1}': all_mem_ce_loss[i]})
+            loss += all_mem_ce_loss[i]
+        loss = loss/len(all_mem_ce_loss)
 
         if not return_dict:
             output = (logits,) + outputs[1:]
@@ -1079,6 +1195,9 @@ class LlamaForCausalLM(LlamaPreTrainedModel):
         if self.config.mem_id is not None:
             assert mem_id == self.config.mem_id, "Chanigng mem_id can break the model. If you really intend to do this, manually disable this check"
         self.config.mem_id = mem_id
+    
+    def set_pad_id(self, pad_id):
+        self.config.pad_id = pad_id
 
     def enable_landmark_insertion(self):
         self.auto_insert_landmarks = True

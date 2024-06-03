@@ -14,6 +14,10 @@
 
 import copy
 import logging
+import random
+import numpy as np
+import pdb
+import wandb
 from dataclasses import dataclass, field
 from functools import partial
 from typing import Dict, Optional, Sequence
@@ -30,12 +34,18 @@ import os
 
 from datasets import load_dataset
 
+# Set random seeds
+random.seed(42)
+np.random.seed(42)
+torch.manual_seed(42)
+
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
 DEFAULT_EOS_TOKEN = "</s>"
 DEFAULT_BOS_TOKEN = "<s>"
 DEFAULT_UNK_TOKEN = "<unk>"
 
+wandb.init(project='better_landmark_attn', name='debug')
 
 @dataclass
 class ModelArguments:
@@ -46,11 +56,11 @@ class TrainingArguments(transformers.TrainingArguments):
     cache_dir: Optional[str] = field(default=None)
     optim: str = field(default="adamw_torch")
     model_max_length: int = field(
-        default=512,
+        default=256,
         metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
     )
     use_flash: bool = field(default=False)
-    mem_freq: int = field(default=63)
+    mem_freq: int = field(default=64)
 
     
 class TrainerCosine(Trainer):
@@ -129,6 +139,7 @@ def train():
         mem_freq=training_args.mem_freq,
         include_landmark_in_loss=not training_args.use_flash
     )
+    # pdb.set_trace()
 
     tokenizer = transformers.AutoTokenizer.from_pretrained(
         model_args.model_name_or_path,
@@ -157,11 +168,22 @@ def train():
 
     mem_id = tokenizer.convert_tokens_to_ids(mem_token)
     model.set_mem_id(mem_id)
+    pad_id = tokenizer.convert_tokens_to_ids(DEFAULT_PAD_TOKEN)
+    model.set_pad_id(pad_id)
+
+    # Freeze all parameters
+    for param in model.parameters():
+        param.requires_grad = False
+
+    # Unfreeze the embedding of the mem_token
+    # model.get_input_embeddings().weight.requires_grad = True
+    # assert model.get_input_embeddings().weight[mem_token_id].requires_grad
     
     rank = int(os.environ.get('RANK', -1))
     if rank > 0:
         barrier()
-    dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
+    # dataset = load_dataset("togethercomputer/RedPajama-Data-1T-Sample", cache_dir=training_args.cache_dir)
+    dataset = load_dataset("ivanzhouyq/RedPajama-Tiny", cache_dir=training_args.cache_dir)
 
     dataset = dataset.map(partial(tokenize_fn,tokenizer),batched=True, num_proc=32, remove_columns=["text", "meta"])
 
@@ -181,12 +203,18 @@ def train():
     print(dataset)
 
     data_collator = DataCollatorForLanguageModeling(tokenizer=tokenizer, mlm=False)
+    # Only pass parameters that require gradients (i.e., the mem_token embedding) to the optimizer
+    model.model.mem_emb = torch.nn.Parameter(model.get_input_embeddings().weight[mem_id].clone(), requires_grad=True)
+    optimizer = torch.optim.AdamW(filter(lambda p: p.requires_grad, model.parameters()), lr=training_args.learning_rate)
 
     trainer = TrainerCosine(
         model=model, tokenizer=tokenizer, args=training_args, 
         train_dataset=dataset["train"],
         eval_dataset=None,
         data_collator=data_collator)
+
+    # Override the optimizer with the custom one
+    trainer.optimizer = optimizer
     trainer.train()
     trainer.save_state()
     trainer.save_model(output_dir=training_args.output_dir)
